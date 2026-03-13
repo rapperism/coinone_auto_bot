@@ -82,16 +82,21 @@ BASE_URL = "https://api.coinone.co.kr"
 # ─────────────────────────────────────────
 class CoinoneClient:
     def __init__(self, access_token: str, secret_key: str):
+        if not access_token or not isinstance(access_token, str):
+            raise ValueError("ACCESS_TOKEN이 비어 있거나 문자열이 아닙니다.")
+        if secret_key is None or not isinstance(secret_key, str):
+            raise ValueError("SECRET_KEY가 비어 있거나 문자열이 아닙니다.")
         self.access_token = access_token
         self.secret_key   = secret_key.encode()
 
     def _sign(self, payload: dict) -> dict:
         payload["access_token"] = self.access_token
         payload["nonce"]        = int(time.time() * 1000)
-
-        encoded = base64.b64encode(json.dumps(payload).encode())
-        sig      = hmac.new(self.secret_key, encoded, hashlib.sha512).hexdigest()
-
+        try:
+            encoded = base64.b64encode(json.dumps(payload).encode())
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"API 서명용 payload 직렬화 실패: {e}") from e
+        sig = hmac.new(self.secret_key, encoded, hashlib.sha512).hexdigest()
         return {
             "X-COINONE-PAYLOAD":   encoded.decode(),
             "X-COINONE-SIGNATURE": sig,
@@ -103,23 +108,43 @@ class CoinoneClient:
         """캔들(OHLCV) 데이터 조회"""
         url = f"{BASE_URL}/public/v2/chart/{symbol.upper()}/KRW"
         params = {"interval": interval, "count": count}
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        # 응답: {"result":"success","chart":[{open,high,low,close,volume,timestamp},...]}
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+        except requests.RequestException as e:
+            log.error("캔들 API 요청 실패: %s", e)
+            raise RuntimeError(f"캔들 조회 실패: {e}") from e
+        except json.JSONDecodeError as e:
+            log.error("캔들 API 응답 JSON 파싱 실패: %s", e)
+            raise RuntimeError(f"캔들 응답 파싱 실패: {e}") from e
         return data.get("chart", [])
 
     def get_orderbook(self, symbol: str) -> dict:
         url = f"{BASE_URL}/public/v2/orderbook/{symbol.upper()}/KRW"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        return r.json()
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            log.error("호가창 API 요청 실패: %s", e)
+            raise RuntimeError(f"호가창 조회 실패: {e}") from e
+        except json.JSONDecodeError as e:
+            log.error("호가창 API 응답 JSON 파싱 실패: %s", e)
+            raise RuntimeError(f"호가창 응답 파싱 실패: {e}") from e
 
     def get_ticker(self, symbol: str) -> dict:
         url = f"{BASE_URL}/public/v2/ticker_new/{symbol.upper()}/KRW"
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        return r.json()
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            log.error("티커 API 요청 실패: %s", e)
+            raise RuntimeError(f"시세 조회 실패: {e}") from e
+        except json.JSONDecodeError as e:
+            log.error("티커 API 응답 JSON 파싱 실패: %s", e)
+            raise RuntimeError(f"시세 응답 파싱 실패: {e}") from e
 
     # ── Private API ─────────────────────────
     def get_balance(self) -> dict:
@@ -134,21 +159,29 @@ class CoinoneClient:
     def _private_post(self, path: str, payload: dict) -> dict:
         payload["access_token"] = self.access_token
         payload["nonce"]        = int(time.time() * 1000)
-
-        raw     = json.dumps(payload, separators=(",", ":"))
+        try:
+            raw = json.dumps(payload, separators=(",", ":"))
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Private API payload 직렬화 실패: {e}") from e
         encoded = base64.b64encode(raw.encode()).decode()
         sig     = hmac.new(self.secret_key,
-                            encoded.encode(), hashlib.sha512).hexdigest()
-
+                           encoded.encode(), hashlib.sha512).hexdigest()
         headers = {
             "X-COINONE-PAYLOAD":   encoded,
             "X-COINONE-SIGNATURE": sig,
             "Content-Type":        "application/json",
         }
-        r = requests.post(f"{BASE_URL}{path}",
-                          data=raw, headers=headers, timeout=10)
-        r.raise_for_status()
-        return r.json()
+        try:
+            r = requests.post(f"{BASE_URL}{path}",
+                              data=raw, headers=headers, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            log.error("Private API 요청 실패 path=%s: %s", path, e)
+            raise RuntimeError(f"Private API 실패 ({path}): {e}") from e
+        except json.JSONDecodeError as e:
+            log.error("Private API 응답 JSON 파싱 실패: %s", e)
+            raise RuntimeError(f"Private API 응답 파싱 실패: {e}") from e
 
     def get_balance_v2(self) -> dict:
         return self._private_post("/v2/account/balance", {})
@@ -196,9 +229,24 @@ class Indicators:
 
     @staticmethod
     def to_df(candles: list) -> pd.DataFrame:
-        df = pd.DataFrame(candles, columns=["timestamp","open","high","low","close","volume"])
-        for c in ["open","high","low","close","volume"]:
-            df[c] = pd.to_numeric(df[c])
+        if candles is None or not isinstance(candles, list):
+            raise ValueError("캔들 데이터가 리스트가 아니거나 None입니다.")
+        if len(candles) == 0:
+            raise ValueError("캔들 데이터가 비어 있습니다.")
+        try:
+            df = pd.DataFrame(
+                candles,
+                columns=["timestamp", "open", "high", "low", "close", "volume"],
+            )
+        except (ValueError, KeyError, TypeError) as e:
+            raise ValueError(f"캔들 DataFrame 생성 실패 (형식 오류): {e}") from e
+        for c in ["open", "high", "low", "close", "volume"]:
+            try:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            except (KeyError, TypeError) as e:
+                raise ValueError(f"캔들 컬럼 변환 실패 ({c}): {e}") from e
+        if df["timestamp"].isna().all() or df["close"].isna().all():
+            raise ValueError("캔들 필수 컬럼(timestamp, close)에 유효한 값이 없습니다.")
         df.sort_values("timestamp", inplace=True)
         df.reset_index(drop=True, inplace=True)
         return df
@@ -259,6 +307,16 @@ class Strategy:
 
     def evaluate(self, df: pd.DataFrame) -> str:
         """'BUY' / 'SELL' / 'HOLD' 반환"""
+        if df is None or len(df) < 2:
+            raise ValueError("전략 평가를 위해 최소 2개 이상의 캔들 행이 필요합니다.")
+        required_keys = (
+            "RSI_PERIOD", "MA_SHORT", "MA_LONG", "MACD_FAST", "MACD_SLOW",
+            "MACD_SIGNAL", "BB_PERIOD", "BB_STD", "VOL_K",
+            "RSI_OVERSOLD", "RSI_OVERBOUGHT",
+        )
+        for k in required_keys:
+            if k not in self.cfg:
+                raise KeyError(f"전략 설정에 필수 키가 없습니다: {k}")
         cfg = self.cfg
         c   = df["close"]
 
@@ -348,22 +406,23 @@ class RiskManager:
         self.holding_qty = 0.0
 
     def should_stop_loss(self, current_price: float) -> bool:
-        if self.entry_price is None:
+        if self.entry_price is None or self.entry_price <= 0:
             return False
         loss_rate = (current_price - self.entry_price) / self.entry_price
         return loss_rate <= -self.cfg["STOP_LOSS_PCT"]
 
     def should_take_profit(self, current_price: float) -> bool:
-        if self.entry_price is None:
+        if self.entry_price is None or self.entry_price <= 0:
             return False
         profit_rate = (current_price - self.entry_price) / self.entry_price
         return profit_rate >= self.cfg["TAKE_PROFIT_PCT"]
 
     def calc_buy_qty(self, balance_krw: float, current_price: float) -> float:
         """매수 수량 계산 (원화 잔고의 ORDER_RATIO 비율)"""
+        if current_price is None or current_price <= 0:
+            raise ValueError("current_price는 0보다 큰 값이어야 합니다.")
         budget = balance_krw * self.cfg["ORDER_RATIO"]
         qty    = budget / current_price
-        # 소수점 6자리로 제한 (BTC 기준)
         return round(qty, 6)
 
 
@@ -379,20 +438,55 @@ class TradingBot:
         self.symbol   = cfg["SYMBOL"]
 
     def get_price(self) -> float:
-        ticker = self.client.get_ticker(self.symbol)
-        # 응답 구조: {"tickers":[{"target_currency":"BTC","last":"..."},...]}
+        try:
+            ticker = self.client.get_ticker(self.symbol)
+        except (RuntimeError, requests.RequestException) as e:
+            raise RuntimeError(f"시세 조회 실패: {e}") from e
+        if not isinstance(ticker, dict):
+            raise ValueError("시세 응답 형식이 올바르지 않습니다.")
         for t in ticker.get("tickers", []):
+            if not isinstance(t, dict):
+                continue
             if t.get("target_currency", "").upper() == self.symbol.upper():
-                return float(t["last"])
-        raise ValueError("시세 조회 실패")
+                last = t.get("last")
+                if last is None:
+                    raise ValueError(f"시세 필드 없음 (target_currency={self.symbol})")
+                try:
+                    return float(last)
+                except (TypeError, ValueError) as e:
+                    raise ValueError(f"시세 값 변환 실패 (last={last!r}): {e}") from e
+        raise ValueError(f"시세 조회 실패: 해당 코인 없음 (symbol={self.symbol})")
 
     def get_krw_balance(self) -> float:
-        res = self.client.get_balance_v2()
-        return float(res.get("krw", {}).get("avail", 0))
+        try:
+            res = self.client.get_balance_v2()
+        except (RuntimeError, requests.RequestException) as e:
+            raise RuntimeError(f"원화 잔고 조회 실패: {e}") from e
+        if not isinstance(res, dict):
+            raise ValueError("잔고 응답 형식이 올바르지 않습니다.")
+        krw = res.get("krw")
+        if not isinstance(krw, dict):
+            return 0.0
+        try:
+            return float(krw.get("avail", 0))
+        except (TypeError, ValueError):
+            return 0.0
 
     def get_coin_balance(self) -> float:
-        res = self.client.get_balance_v2()
-        return float(res.get(self.symbol, {}).get("avail", 0))
+        try:
+            res = self.client.get_balance_v2()
+        except (RuntimeError, requests.RequestException) as e:
+            raise RuntimeError(f"코인 잔고 조회 실패: {e}") from e
+        if not isinstance(res, dict):
+            raise ValueError("잔고 응답 형식이 올바르지 않습니다.")
+        # API는 대문자 통화 코드를 반환할 수 있음
+        coin_balance = res.get(self.symbol) or res.get(self.symbol.upper())
+        if not isinstance(coin_balance, dict):
+            return 0.0
+        try:
+            return float(coin_balance.get("avail", 0))
+        except (TypeError, ValueError):
+            return 0.0
 
     def run(self):
         log.info("=" * 50)
@@ -422,13 +516,16 @@ class TradingBot:
             return
 
         df = Indicators.to_df(candles)
+        if len(df) < 2:
+            log.warning("캔들 변환 후 행 수 부족, 대기 중...")
+            return
 
         # 2. 현재가
         price = float(df.iloc[-1]["close"])
         log.info(f"[{now}] {self.symbol.upper()} 현재가: {price:,.0f} KRW")
 
         # 3. 손절/익절 체크 (포지션 보유 중일 때)
-        if self.risk.entry_price is not None:
+        if self.risk.entry_price is not None and self.risk.entry_price > 0:
             if self.risk.should_stop_loss(price):
                 log.warning(f"⛔ 손절 실행! 진입가:{self.risk.entry_price:,.0f} 현재:{price:,.0f}")
                 self._sell_all(price, reason="손절")
@@ -462,10 +559,10 @@ class TradingBot:
             log.info(f"📈 매수 주문: {qty} {self.symbol.upper()} @ {limit_price:,.0f} KRW")
 
             # ⚠️  실제 주문 실행 시 아래 주석을 해제하세요
-            # res = self.client.place_order(self.symbol, "BUY", qty, limit_price)
-            # log.info(f"주문 결과: {res}")
+            res = self.client.place_order(self.symbol, "BUY", qty, limit_price)
+            log.info(f"주문 결과: {res}")
 
-            log.info("[시뮬레이션] 실제 주문은 코드 주석 해제 후 실행")
+            # log.info("[시뮬레이션] 실제 주문은 코드 주석 해제 후 실행")
             self.risk.set_position(price, qty)
 
         except Exception as e:
@@ -485,11 +582,11 @@ class TradingBot:
             log.info(f"📉 매도 주문({reason}): {qty} {self.symbol.upper()} @ {limit_price:,.0f} KRW")
 
             # ⚠️  실제 주문 실행 시 아래 주석을 해제하세요
-            # res = self.client.place_order(self.symbol, "SELL", qty, limit_price)
-            # log.info(f"주문 결과: {res}")
+            res = self.client.place_order(self.symbol, "SELL", qty, limit_price)
+            log.info(f"주문 결과: {res}")
 
-            log.info("[시뮬레이션] 실제 주문은 코드 주석 해제 후 실행")
-            if self.risk.entry_price:
+            # log.info("[시뮬레이션] 실제 주문은 코드 주석 해제 후 실행")
+            if self.risk.entry_price and self.risk.entry_price > 0:
                 pnl = (price - self.risk.entry_price) * qty
                 pnl_pct = (price - self.risk.entry_price) / self.risk.entry_price * 100
                 log.info(f"손익: {pnl:+,.0f} KRW ({pnl_pct:+.2f}%)")
@@ -502,6 +599,28 @@ class TradingBot:
 # ─────────────────────────────────────────
 #  엔트리포인트
 # ─────────────────────────────────────────
+def _validate_config(cfg: dict) -> None:
+    """시작 전 필수 설정 검증."""
+    if not cfg.get("ACCESS_TOKEN") or cfg.get("ACCESS_TOKEN") == "여기에_액세스_토큰":
+        raise ValueError(
+            "COINONE_ACCESS_TOKEN이 설정되지 않았습니다. .env 또는 환경변수를 확인하세요."
+        )
+    if not cfg.get("SECRET_KEY") or cfg.get("SECRET_KEY") == "여기에_시크릿_키":
+        raise ValueError(
+            "COINONE_SECRET_KEY가 설정되지 않았습니다. .env 또는 환경변수를 확인하세요."
+        )
+    if not isinstance(cfg.get("SECRET_KEY"), str):
+        raise ValueError("SECRET_KEY는 문자열이어야 합니다.")
+
+
 if __name__ == "__main__":
-    bot = TradingBot(CONFIG)
-    bot.run()
+    try:
+        _validate_config(CONFIG)
+        bot = TradingBot(CONFIG)
+        bot.run()
+    except ValueError as e:
+        log.error("설정 오류: %s", e)
+        sys.exit(1)
+    except Exception as e:
+        log.error("봇 시작 실패: %s", e, exc_info=True)
+        sys.exit(1)
