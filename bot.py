@@ -105,9 +105,10 @@ class CoinoneClient:
 
     # ── Public API ──────────────────────────
     def get_candles(self, symbol: str, interval: str = "1m", count: int = 100) -> list:
-        """캔들(OHLCV) 데이터 조회"""
-        url = f"{BASE_URL}/public/v2/chart/{symbol.upper()}/KRW"
-        params = {"interval": interval, "count": count}
+        """캔들(OHLCV) 데이터 조회. API 경로: quote_currency/target_currency (문서 기준)."""
+        # 코인원 문서: /public/v2/chart/{quote_currency}/{target_currency} (예: KRW/BTC)
+        url = f"{BASE_URL}/public/v2/chart/KRW/{symbol.upper()}"
+        params = {"interval": interval, "size": min(max(1, count), 500)}  # API는 size, 1~500
         try:
             r = requests.get(url, params=params, timeout=10)
             r.raise_for_status()
@@ -118,7 +119,14 @@ class CoinoneClient:
         except json.JSONDecodeError as e:
             log.error("캔들 API 응답 JSON 파싱 실패: %s", e)
             raise RuntimeError(f"캔들 응답 파싱 실패: {e}") from e
-        return data.get("chart", [])
+        chart = data.get("chart", [])
+        if data.get("result") == "error" and not chart:
+            log.warning("캔들 API result=error (경로/파라미터 확인): %s", data.get("error_code", data))
+        # API는 target_volume/quote_volume 반환 → volume 컬럼으로 통일
+        for c in chart:
+            if "volume" not in c and "target_volume" in c:
+                c["volume"] = c["target_volume"]
+        return chart
 
     def get_orderbook(self, symbol: str) -> dict:
         url = f"{BASE_URL}/public/v2/orderbook/{symbol.upper()}/KRW"
