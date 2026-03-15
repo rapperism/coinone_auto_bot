@@ -10,6 +10,7 @@ import hashlib
 import base64
 import json
 import logging
+import logging.handlers
 import os
 import sys
 from datetime import datetime
@@ -21,14 +22,23 @@ import pandas as pd
 from dotenv import load_dotenv
 
 # ─────────────────────────────────────────
-#  로깅 설정
+#  로깅 설정 (일 단위 로테이션, 30일 초과 백업 자동 삭제)
 # ─────────────────────────────────────────
+_log_fmt = "%(asctime)s [%(levelname)s] %(message)s"
+_file_handler = logging.handlers.TimedRotatingFileHandler(
+    "bot.log",
+    when="midnight",      # 자정 기준 일 단위
+    interval=1,
+    backupCount=30,       # 30일 지난 백업 자동 삭제
+    encoding="utf-8",
+)
+_file_handler.suffix = "%Y-%m-%d"
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format=_log_fmt,
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("bot.log", encoding="utf-8"),
+        _file_handler,
     ],
 )
 log = logging.getLogger(__name__)
