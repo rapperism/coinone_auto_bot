@@ -4,6 +4,7 @@
 """
 
 import time
+import uuid
 import hmac
 import hashlib
 import base64
@@ -91,7 +92,7 @@ class CoinoneClient:
 
     def _sign(self, payload: dict) -> dict:
         payload["access_token"] = self.access_token
-        payload["nonce"]        = int(time.time() * 1000)
+        payload["nonce"]        = str(uuid.uuid4())
         try:
             encoded = base64.b64encode(json.dumps(payload).encode())
         except (TypeError, ValueError) as e:
@@ -166,7 +167,7 @@ class CoinoneClient:
 
     def _private_post(self, path: str, payload: dict) -> dict:
         payload["access_token"] = self.access_token
-        payload["nonce"]        = int(time.time() * 1000)
+        payload["nonce"]        = str(uuid.uuid4())
         try:
             raw = json.dumps(payload, separators=(",", ":"))
         except (TypeError, ValueError) as e:
@@ -570,7 +571,9 @@ class TradingBot:
             res = self.client.place_order(self.symbol, "BUY", qty, limit_price)
             log.info(f"주문 결과: {res}")
 
-            # log.info("[시뮬레이션] 실제 주문은 코드 주석 해제 후 실행")
+            if res.get("result") == "error":
+                log.warning("매수 주문 실패: %s - %s", res.get("error_code"), res.get("error_msg"))
+                return
             self.risk.set_position(price, qty)
 
         except Exception as e:
@@ -593,7 +596,9 @@ class TradingBot:
             res = self.client.place_order(self.symbol, "SELL", qty, limit_price)
             log.info(f"주문 결과: {res}")
 
-            # log.info("[시뮬레이션] 실제 주문은 코드 주석 해제 후 실행")
+            if res.get("result") == "error":
+                log.warning("매도 주문 실패: %s - %s", res.get("error_code"), res.get("error_msg"))
+                return
             if self.risk.entry_price and self.risk.entry_price > 0:
                 pnl = (price - self.risk.entry_price) * qty
                 pnl_pct = (price - self.risk.entry_price) / self.risk.entry_price * 100
