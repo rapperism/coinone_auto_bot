@@ -24,9 +24,11 @@ from dotenv import load_dotenv
 # ─────────────────────────────────────────
 #  로깅 설정 (일 단위 로테이션, 30일 초과 백업 자동 삭제)
 # ─────────────────────────────────────────
+_log_dir = "logs"
+os.makedirs(_log_dir, exist_ok=True)
 _log_fmt = "%(asctime)s [%(levelname)s] %(message)s"
 _file_handler = logging.handlers.TimedRotatingFileHandler(
-    "bot.log",
+    os.path.join(_log_dir, "bot.log"),
     when="midnight",      # 자정 기준 일 단위
     interval=1,
     backupCount=30,       # 30일 지난 백업 자동 삭제
