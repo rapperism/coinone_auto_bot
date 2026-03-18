@@ -71,11 +71,16 @@ CONFIG = {
     "MACD_SIGNAL":       9,
 
     "VOL_K":             0.5,     # 변동성 돌파 K값 (0.3~0.7 권장)
+    "VOL_BREAKOUT_USE_DAILY": True,  # True면 변동성 돌파 목표가를 일봉 전일 고·저 + 당일 시가로 계산 (클래식 전략)
+
+    # 신호 완화: True면 골든/데드크로스·MACD 전환 "순간"뿐 아니라 "단기>장기 유지", "히스토그램 양수 유지"도 1점
+    "RELAX_CROSS_SIGNALS": True,
 
     # 리스크 관리
     "ORDER_RATIO":       0.3,     # 보유 원화의 최대 몇 % 를 1회 매수에 사용
     "STOP_LOSS_PCT":     0.03,    # 매수가 대비 -3% 손절
     "TAKE_PROFIT_PCT":   0.05,    # 매수가 대비 +5% 익절
+    "TAKER_FEE_PCT":     0.02,    # 코인원 API 체결 수수료 0.02% (매수·매도 각각). 수수료 감안 손익·손실 매도 보류에 사용
 
     # 봇 루프 주기 (초)
     "LOOP_INTERVAL":     60,
@@ -140,7 +145,8 @@ class CoinoneClient:
         return chart
 
     def get_orderbook(self, symbol: str) -> dict:
-        url = f"{BASE_URL}/public/v2/orderbook/{symbol.upper()}/KRW"
+        # 코인원 문서: orderbook/{quote_currency}/{target_currency} → KRW/BTC
+        url = f"{BASE_URL}/public/v2/orderbook/KRW/{symbol.upper()}"
         try:
             r = requests.get(url, timeout=10)
             r.raise_for_status()
@@ -324,8 +330,8 @@ class Strategy:
     def __init__(self, cfg: dict):
         self.cfg = cfg
 
-    def evaluate(self, df: pd.DataFrame) -> str:
-        """'BUY' / 'SELL' / 'HOLD' 반환"""
+    def evaluate(self, df: pd.DataFrame, daily_candles: Optional[list] = None) -> str:
+        """'BUY' / 'SELL' / 'HOLD' 반환. daily_candles 있으면 변동성 돌파는 일봉(전일 고·저+당일 시가) 기준."""
         if df is None or len(df) < 2:
             raise ValueError("전략 평가를 위해 최소 2개 이상의 캔들 행이 필요합니다.")
         required_keys = (
@@ -349,17 +355,36 @@ class Strategy:
         prev  = df.iloc[-2]
         price = last["close"]
 
-        vol_target = Indicators.volatility_breakout_target(
-            prev["high"], prev["low"], last["open"], cfg["VOL_K"]
-        )
+        # 변동성 돌파 목표가: 일봉 옵션 사용 시 전일 고·저 + 당일 시가 (클래식)
+        if cfg.get("VOL_BREAKOUT_USE_DAILY") and daily_candles and len(daily_candles) >= 2:
+            # daily_candles: [ ..., 전일(마감), 당일(진행중) ]
+            d_prev = daily_candles[-2]
+            d_today = daily_candles[-1]
+            prev_high = float(d_prev.get("high", d_prev[2] if isinstance(d_prev, (list, tuple)) else 0))
+            prev_low  = float(d_prev.get("low",  d_prev[3] if isinstance(d_prev, (list, tuple)) else 0))
+            today_open = float(d_today.get("open", d_today[1] if isinstance(d_today, (list, tuple)) else 0))
+            vol_target = Indicators.volatility_breakout_target(
+                prev_high, prev_low, today_open, cfg["VOL_K"]
+            )
+        else:
+            vol_target = Indicators.volatility_breakout_target(
+                prev["high"], prev["low"], last["open"], cfg["VOL_K"]
+            )
+
+        relax = cfg.get("RELAX_CROSS_SIGNALS", False)
 
         # ── 매수 신호 점수 ──────────────────────
         buy_score = 0
         buy_reasons = []
 
-        if ma_short.iloc[-1] > ma_long.iloc[-1] and ma_short.iloc[-2] <= ma_long.iloc[-2]:
-            buy_score += 1
-            buy_reasons.append("MA 골든크로스")
+        if relax:
+            if ma_short.iloc[-1] > ma_long.iloc[-1]:
+                buy_score += 1
+                buy_reasons.append("MA 단기>장기(상승추세)")
+        else:
+            if ma_short.iloc[-1] > ma_long.iloc[-1] and ma_short.iloc[-2] <= ma_long.iloc[-2]:
+                buy_score += 1
+                buy_reasons.append("MA 골든크로스")
 
         if rsi_s.iloc[-1] < cfg["RSI_OVERSOLD"]:
             buy_score += 1
@@ -369,9 +394,14 @@ class Strategy:
             buy_score += 1
             buy_reasons.append(f"변동성돌파(목표가:{vol_target:,.0f})")
 
-        if hist.iloc[-2] < 0 < hist.iloc[-1]:
-            buy_score += 1
-            buy_reasons.append("MACD 히스토그램 양전환")
+        if relax:
+            if hist.iloc[-1] > 0:
+                buy_score += 1
+                buy_reasons.append("MACD 히스토그램 양수")
+        else:
+            if hist.iloc[-2] < 0 < hist.iloc[-1]:
+                buy_score += 1
+                buy_reasons.append("MACD 히스토그램 양전환")
 
         if prev["close"] <= bb_lower.iloc[-2] and price > bb_lower.iloc[-1]:
             buy_score += 1
@@ -381,17 +411,27 @@ class Strategy:
         sell_score = 0
         sell_reasons = []
 
-        if ma_short.iloc[-1] < ma_long.iloc[-1] and ma_short.iloc[-2] >= ma_long.iloc[-2]:
-            sell_score += 1
-            sell_reasons.append("MA 데드크로스")
+        if relax:
+            if ma_short.iloc[-1] < ma_long.iloc[-1]:
+                sell_score += 1
+                sell_reasons.append("MA 단기<장기(하락추세)")
+        else:
+            if ma_short.iloc[-1] < ma_long.iloc[-1] and ma_short.iloc[-2] >= ma_long.iloc[-2]:
+                sell_score += 1
+                sell_reasons.append("MA 데드크로스")
 
         if rsi_s.iloc[-1] > cfg["RSI_OVERBOUGHT"]:
             sell_score += 1
             sell_reasons.append(f"RSI 과매수({rsi_s.iloc[-1]:.1f})")
 
-        if hist.iloc[-2] > 0 > hist.iloc[-1]:
-            sell_score += 1
-            sell_reasons.append("MACD 히스토그램 음전환")
+        if relax:
+            if hist.iloc[-1] < 0:
+                sell_score += 1
+                sell_reasons.append("MACD 히스토그램 음수")
+        else:
+            if hist.iloc[-2] > 0 > hist.iloc[-1]:
+                sell_score += 1
+                sell_reasons.append("MACD 히스토그램 음전환")
 
         if prev["close"] >= bb_upper.iloc[-2] and price < bb_upper.iloc[-1]:
             sell_score += 1
@@ -436,6 +476,20 @@ class RiskManager:
         profit_rate = (current_price - self.entry_price) / self.entry_price
         return profit_rate >= self.cfg["TAKE_PROFIT_PCT"]
 
+    def break_even_price(self, entry: float) -> float:
+        """수수료 감안 시 손익 0이 되는 매도가. 이 가격 미만으로 매도하면 통장 기준 손실."""
+        fee = self.cfg.get("TAKER_FEE_PCT", 0.02) / 100.0
+        return entry * (1 + fee) / (1 - fee)
+
+    def pnl_after_fee(self, entry: float, sell_price: float, qty: float) -> tuple[float, float]:
+        """수수료 반영 손익(KRW)과 수익률(%) 반환."""
+        fee = self.cfg.get("TAKER_FEE_PCT", 0.02) / 100.0
+        cost = entry * qty * (1 + fee)
+        proceeds = sell_price * qty * (1 - fee)
+        pnl_krw = proceeds - cost
+        pnl_pct = (pnl_krw / cost) * 100 if cost > 0 else 0.0
+        return pnl_krw, pnl_pct
+
     def calc_buy_qty(self, balance_krw: float, current_price: float) -> float:
         """매수 수량 계산 (원화 잔고의 ORDER_RATIO 비율)"""
         if current_price is None or current_price <= 0:
@@ -477,35 +531,41 @@ class TradingBot:
         raise ValueError(f"시세 조회 실패: 해당 코인 없음 (symbol={self.symbol})")
 
     def get_krw_balance(self) -> float:
+        """V2.1 잔고 API 사용. balances 배열에서 currency=KRW인 항목의 available 사용."""
         try:
-            res = self.client.get_balance_v2()
+            res = self.client.get_balance()
         except (RuntimeError, requests.RequestException) as e:
             raise RuntimeError(f"원화 잔고 조회 실패: {e}") from e
-        if not isinstance(res, dict):
-            raise ValueError("잔고 응답 형식이 올바르지 않습니다.")
-        krw = res.get("krw")
-        if not isinstance(krw, dict):
+        if not isinstance(res, dict) or res.get("result") == "error":
             return 0.0
-        try:
-            return float(krw.get("avail", 0))
-        except (TypeError, ValueError):
-            return 0.0
+        for b in res.get("balances", []):
+            if not isinstance(b, dict):
+                continue
+            if b.get("currency") == "KRW":
+                try:
+                    return float(b.get("available", 0))
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
 
     def get_coin_balance(self) -> float:
+        """V2.1 잔고 API 사용. balances 배열에서 해당 코인 항목의 available 사용."""
         try:
-            res = self.client.get_balance_v2()
+            res = self.client.get_balance()
         except (RuntimeError, requests.RequestException) as e:
             raise RuntimeError(f"코인 잔고 조회 실패: {e}") from e
-        if not isinstance(res, dict):
-            raise ValueError("잔고 응답 형식이 올바르지 않습니다.")
-        # API는 대문자 통화 코드를 반환할 수 있음
-        coin_balance = res.get(self.symbol) or res.get(self.symbol.upper())
-        if not isinstance(coin_balance, dict):
+        if not isinstance(res, dict) or res.get("result") == "error":
             return 0.0
-        try:
-            return float(coin_balance.get("avail", 0))
-        except (TypeError, ValueError):
-            return 0.0
+        sym_upper = self.symbol.upper()
+        for b in res.get("balances", []):
+            if not isinstance(b, dict):
+                continue
+            if b.get("currency") == sym_upper:
+                try:
+                    return float(b.get("available", 0))
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
 
     def run(self):
         log.info("=" * 50)
@@ -554,8 +614,14 @@ class TradingBot:
                 self._sell_all(price, reason="익절")
                 return
 
-        # 4. 전략 신호 평가
-        signal = self.strategy.evaluate(df)
+        # 4. 전략 신호 평가 (변동성 돌파 일봉 사용 시 전일 고·저+당일 시가로 목표가 계산)
+        daily_candles = None
+        if self.cfg.get("VOL_BREAKOUT_USE_DAILY"):
+            try:
+                daily_candles = self.client.get_candles(self.symbol, "1D", 3)
+            except Exception as e:
+                log.warning("일봉 조회 실패(변동성 돌파는 분봉 기준으로 계산): %s", e)
+        signal = self.strategy.evaluate(df, daily_candles=daily_candles)
         log.info(f"전략 신호: {signal}")
 
         # 5. 매매 실행
@@ -599,6 +665,16 @@ class TradingBot:
                 self.risk.clear_position()
                 return
 
+            # 수수료 감안 시 손실이면 매도 보류 (통장 마이너스 방지)
+            if self.risk.entry_price and self.risk.entry_price > 0:
+                be_price = self.risk.break_even_price(self.risk.entry_price)
+                if price < be_price:
+                    log.warning(
+                        "수수료 감안 시 손실이라 매도 보류 (현재가 %s < 손익분기 %s)",
+                        f"{price:,.0f}", f"{be_price:,.0f}",
+                    )
+                    return
+
             limit_price = round(price * 0.9995)
             log.info(f"📉 매도 주문({reason}): {qty} {self.symbol.upper()} @ {limit_price:,.0f} KRW")
 
@@ -610,9 +686,10 @@ class TradingBot:
                 log.warning("매도 주문 실패: %s - %s", res.get("error_code"), res.get("error_msg"))
                 return
             if self.risk.entry_price and self.risk.entry_price > 0:
-                pnl = (price - self.risk.entry_price) * qty
-                pnl_pct = (price - self.risk.entry_price) / self.risk.entry_price * 100
-                log.info(f"손익: {pnl:+,.0f} KRW ({pnl_pct:+.2f}%)")
+                pnl_krw, pnl_pct = self.risk.pnl_after_fee(
+                    self.risk.entry_price, price, qty
+                )
+                log.info(f"손익(수수료 반영): {pnl_krw:+,.0f} KRW ({pnl_pct:+.2f}%)")
             self.risk.clear_position()
 
         except Exception as e:
