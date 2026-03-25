@@ -82,9 +82,16 @@ CONFIG = {
 
     # 리스크 관리
     "ORDER_RATIO":       0.3,     # 보유 원화의 최대 몇 % 를 1회 매수에 사용
-    "STOP_LOSS_PCT":     0.03,    # 매수가 대비 -3% 손절
+    "USE_STOP_LOSS":     False,   # False면 손절 미사용(소액·수수료만 깎이는 손절 회피 등)
+    "STOP_LOSS_PCT":     0.03,    # USE_STOP_LOSS True일 때만: 매수가 대비 -3% 손절
     "TAKE_PROFIT_PCT":   0.05,    # 매수가 대비 +5% 익절
     "TAKER_FEE_PCT":     0.02,    # 코인원 API 체결 수수료 0.02% (매수·매도 각각). 수수료 감안 손익·손실 매도 보류에 사용
+
+    # 포지션 보유 중 신호가 BUY가 아니고(HOLD/SELL), 현재가가 수수료 손익분기 이상이면 청산.
+    # BUY만 뜨다가 가격이 분기 아래로 내려온 뒤 SELL이 나오면 매도 보류에 걸리는 구간을 줄임.
+    "EXIT_WHEN_NOT_BUY_ABOVE_BE": True,
+    # True면 전략 SELL만 손익분기 미만에서도 매도 시도(실제 손실 가능). False 권장.
+    "STRATEGY_SELL_ALLOW_BELOW_BREAKEVEN": False,
 
     # 봇 루프 주기 (초)
     "LOOP_INTERVAL":     60,
@@ -788,7 +795,7 @@ class TradingBot:
 
         # 3. 손절/익절 체크 (포지션 보유 중일 때)
         if self.risk.entry_price is not None and self.risk.entry_price > 0:
-            if self.risk.should_stop_loss(price):
+            if self.cfg.get("USE_STOP_LOSS", False) and self.risk.should_stop_loss(price):
                 log.warning(f"⛔ 손절 실행! 진입가:{self.risk.entry_price:,.0f} 현재:{price:,.0f}")
                 self._sell_all(price, reason="손절")
                 return
@@ -808,9 +815,18 @@ class TradingBot:
         log.info(f"전략 신호: {signal}")
 
         # 5. 매매 실행
-        if signal == "BUY" and self.risk.entry_price is None:
+        in_pos = self.risk.entry_price is not None and self.risk.entry_price > 0
+
+        if signal == "BUY" and not in_pos:
             self._buy(price)
-        elif signal == "SELL" and self.risk.holding_qty > 0:
+        elif (
+            self.cfg.get("EXIT_WHEN_NOT_BUY_ABOVE_BE", True)
+            and in_pos
+            and signal != "BUY"
+            and price >= self.risk.break_even_price(self.risk.entry_price)
+        ):
+            self._sell_all(price, reason="약세·수수료분기 이상 청산")
+        elif signal == "SELL" and in_pos:
             self._sell_all(price, reason="전략 신호")
 
     def _buy(self, price: float):
@@ -893,10 +909,19 @@ class TradingBot:
                 self.risk.clear_position()
                 return
 
-            # 수수료 감안 시 손실이면 매도 보류 (통장 마이너스 방지)
+            # 수수료 감안 시 손실이면 매도 보류 (손절·익절·명시 옵션은 예외)
             if self.risk.entry_price and self.risk.entry_price > 0:
                 be_price = self.risk.break_even_price(self.risk.entry_price)
-                if price < be_price:
+                allow_below = (
+                    reason == "전략 신호"
+                    and self.cfg.get("STRATEGY_SELL_ALLOW_BELOW_BREAKEVEN", False)
+                )
+                force_risk = reason in ("손절", "익절")
+                if (
+                    price < be_price
+                    and not force_risk
+                    and not allow_below
+                ):
                     log.warning(
                         "수수료 감안 시 손실이라 매도 보류 (현재가 %s < 손익분기 %s)",
                         f"{price:,.0f}", f"{be_price:,.0f}",
