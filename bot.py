@@ -751,6 +751,40 @@ class TradingBot:
                     return 0.0
         return 0.0
 
+    def get_currency_balance(self, symbol: str) -> Optional[dict]:
+        """
+        V2.1 잔고 한 줄. average_price=거래소 평단, total=가용+주문잠금.
+        문서: available+limit 이 전체 잔고.
+        """
+        try:
+            res = self.get_balance()
+        except (RuntimeError, requests.RequestException) as e:
+            log.warning("잔고 API 실패(get_currency_balance): %s", e)
+            return None
+        if not isinstance(res, dict) or res.get("result") != "success":
+            return None
+        sym = symbol.upper()
+        for b in res.get("balances", []):
+            if not isinstance(b, dict) or b.get("currency") != sym:
+                continue
+            try:
+                av = float(b.get("available", 0) or 0)
+                lm = float(b.get("limit", 0) or 0)
+                ap = b.get("average_price")
+                if ap is None or ap == "":
+                    avg = 0.0
+                else:
+                    avg = float(ap)
+            except (TypeError, ValueError):
+                return None
+            return {
+                "available": av,
+                "limit": lm,
+                "total": av + lm,
+                "average_price": avg,
+            }
+        return None
+
     def run(self):
         log.info("=" * 50)
         log.info(f"코인원 자동매매 봇 시작 | 대상: {self.symbol.upper()}/KRW")
@@ -793,6 +827,9 @@ class TradingBot:
         price = float(df.iloc[-1]["close"])
         log.info(f"[{now}] {self.symbol.upper()} 현재가: {price:,.0f} KRW")
 
+        # 2b. 거래소 잔고·평단 동기화 (재시작 후에도 포지션 인식, 손익분기는 average_price 기준)
+        self._sync_position_from_exchange(price)
+
         # 3. 손절/익절 체크 (포지션 보유 중일 때)
         if self.risk.entry_price is not None and self.risk.entry_price > 0:
             if self.cfg.get("USE_STOP_LOSS", False) and self.risk.should_stop_loss(price):
@@ -814,8 +851,12 @@ class TradingBot:
         signal = self.strategy.evaluate(df, daily_candles=daily_candles)
         log.info(f"전략 신호: {signal}")
 
-        # 5. 매매 실행
-        in_pos = self.risk.entry_price is not None and self.risk.entry_price > 0
+        # 5. 매매 실행 (보유는 거래소 수량 기준 — 메모리만으로는 재시작 시 중복 매수)
+        in_pos = (
+            self.risk.holding_qty > 0
+            and self.risk.entry_price is not None
+            and self.risk.entry_price > 0
+        )
 
         if signal == "BUY" and not in_pos:
             self._buy(price)
@@ -829,10 +870,57 @@ class TradingBot:
         elif signal == "SELL" and in_pos:
             self._sell_all(price, reason="전략 신호")
 
+    def _sync_position_from_exchange(self, mark_price: float) -> None:
+        row = self.client.get_currency_balance(self.symbol)
+        if row is None:
+            return
+        try:
+            mc = self.client.get_market_constraints(self.symbol)
+            min_q = float(mc["min_qty"])
+        except (RuntimeError, KeyError, TypeError, ValueError):
+            min_q = 1e-8
+        total = row["total"]
+        if total < min_q:
+            if self.risk.entry_price is not None or self.risk.holding_qty > 0:
+                self.risk.clear_position()
+                log.info("거래소 코인 잔고 없음 → 포지션 추적 초기화")
+            return
+
+        old_ep = self.risk.entry_price
+        old_h = self.risk.holding_qty
+        avg = row["average_price"]
+        if avg > 0:
+            self.risk.entry_price = float(avg)
+        elif self.risk.entry_price is None or self.risk.entry_price <= 0:
+            self.risk.entry_price = float(mark_price)
+            log.warning(
+                "거래소 average_price 없음·0 — 손익분기는 현재가 근사 (%s원)",
+                f"{mark_price:,.0f}",
+            )
+        self.risk.holding_qty = total
+
+        ep_changed = old_ep is None or abs((old_ep or 0) - self.risk.entry_price) > 100
+        qty_changed = abs(old_h - total) > 1e-10
+        if ep_changed or qty_changed:
+            log.info(
+                "거래소 동기화 | 평균매수가 %s원 | 보유 %s BTC (가용 %s + 잠금 %s)",
+                f"{self.risk.entry_price:,.0f}",
+                f"{total}",
+                f"{row['available']}",
+                f"{row['limit']}",
+            )
+
     def _buy(self, price: float):
         try:
-            krw = self.get_krw_balance()
             mc = self.client.get_market_constraints(self.symbol)
+            min_q = float(mc["min_qty"])
+            if self.risk.holding_qty >= min_q:
+                log.info(
+                    "이미 코인 보유 중(거래소 동기화 기준) — 추가 매수 생략",
+                )
+                return
+
+            krw = self.get_krw_balance()
             qty = self.risk.calc_buy_qty(krw, price, mc["qty_unit_str"])
             min_krw = mc["min_order_amount"]
 
@@ -895,6 +983,7 @@ class TradingBot:
                 log.warning("매수 주문 실패: %s - %s", res.get("error_code"), res.get("error_msg"))
                 return
             self.risk.set_position(price, qty)
+            self._sync_position_from_exchange(price)
 
         except Exception as e:
             log.error(f"매수 실패: {e}")
