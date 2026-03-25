@@ -6,6 +6,7 @@
 import time
 import uuid
 import hmac
+import math
 import hashlib
 import base64
 import json
@@ -106,6 +107,7 @@ class CoinoneClient:
             raise ValueError("SECRET_KEY가 비어 있거나 문자열이 아닙니다.")
         self.access_token = access_token
         self.secret_key   = secret_key.encode()
+        self._range_price_units_cache: dict[str, list] = {}
 
     def _sign(self, payload: dict) -> dict:
         payload["access_token"] = self.access_token
@@ -173,6 +175,59 @@ class CoinoneClient:
             log.error("티커 API 응답 JSON 파싱 실패: %s", e)
             raise RuntimeError(f"시세 응답 파싱 실패: {e}") from e
 
+    def get_range_price_units(self, symbol: str) -> list:
+        """KRW 마켓 호가 단위 구간 (오류 310 방지). GET /public/v2/range_units/KRW/{symbol}"""
+        sym = symbol.upper()
+        if sym in self._range_price_units_cache:
+            return self._range_price_units_cache[sym]
+        url = f"{BASE_URL}/public/v2/range_units/KRW/{sym}"
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+        except requests.RequestException as e:
+            log.error("호가 단위 API 요청 실패: %s", e)
+            raise RuntimeError(f"호가 단위 조회 실패: {e}") from e
+        except json.JSONDecodeError as e:
+            log.error("호가 단위 API JSON 파싱 실패: %s", e)
+            raise RuntimeError(f"호가 단위 응답 파싱 실패: {e}") from e
+        if data.get("result") != "success":
+            raise RuntimeError(f"호가 단위 API 오류: {data}")
+        rows = data.get("range_price_units") or []
+        if not rows:
+            raise RuntimeError("range_price_units 가 비어 있습니다.")
+        self._range_price_units_cache[sym] = rows
+        return rows
+
+    @staticmethod
+    def _price_unit_for_krw(price: float, rows: list) -> float:
+        p = float(price)
+        for row in rows:
+            rmin = float(row["range_min"])
+            rmax = float(row["next_range_min"])
+            u = float(row["price_unit"])
+            if rmin <= p < rmax:
+                return u
+        return float(rows[-1]["price_unit"])
+
+    @staticmethod
+    def _snap_krw_limit_price(price: float, side: str, unit: float) -> float:
+        if unit <= 0:
+            raise ValueError("price_unit 이 0 이하입니다.")
+        q = float(price) / unit
+        if side.upper() == "BUY":
+            q = math.ceil(q - 1e-12)
+        else:
+            q = math.floor(q + 1e-12)
+        return q * unit
+
+    @staticmethod
+    def _format_limit_price_str(snapped: float, unit: float) -> str:
+        if unit >= 1:
+            return str(int(round(snapped)))
+        text = f"{snapped:.10f}".rstrip("0").rstrip(".")
+        return text if text else "0"
+
     # ── Private API ─────────────────────────
     def get_balance(self) -> dict:
         payload = {"request_type": "BALANCE"}
@@ -230,7 +285,15 @@ class CoinoneClient:
             "qty": str(qty),
         }
         if order_type == "LIMIT" and price is not None:
-            payload["price"] = str(int(price))
+            rows = self.get_range_price_units(symbol)
+            unit = self._price_unit_for_krw(float(price), rows)
+            snapped = self._snap_krw_limit_price(float(price), side, unit)
+            wanted = int(round(float(price)))
+            if unit >= 1:
+                got = int(round(snapped))
+                if wanted != got:
+                    log.info("지정가 호가단위 스냅: %s → %s KRW (unit=%s)", wanted, got, unit)
+            payload["price"] = self._format_limit_price_str(snapped, unit)
             payload["post_only"] = post_only
 
         return self._private_post("/v2.1/order", payload)
