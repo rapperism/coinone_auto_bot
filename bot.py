@@ -81,8 +81,8 @@ CONFIG = {
     "RELAX_CROSS_SIGNALS": True,
 
     # 리스크 관리
-    "ORDER_RATIO":       0.3,     # 보유 원화의 최대 몇 % 를 1회 매수에 사용
-    "USE_STOP_LOSS":     False,   # False면 손절 미사용(소액·수수료만 깎이는 손절 회피 등)
+    "ORDER_RATIO":       1.0,     # 보유 원화의 최대 몇 % 를 1회 매수에 사용
+    "USE_STOP_LOSS":     True,   # False면 손절 미사용(소액·수수료만 깎이는 손절 회피 등)
     "STOP_LOSS_PCT":     0.03,    # USE_STOP_LOSS True일 때만: 매수가 대비 -3% 손절
     "TAKE_PROFIT_PCT":   0.05,    # 매수가 대비 +5% 익절
     "TAKER_FEE_PCT":     0.02,    # 코인원 API 체결 수수료 0.02% (매수·매도 각각). 수수료 감안 손익·손실 매도 보류에 사용
@@ -425,6 +425,40 @@ class CoinoneClient:
         res = self._private_post("/v2.1/order/open_orders", payload)
         return res.get("open_orders", [])
 
+    def get_currency_balance(self, symbol: str) -> Optional[dict]:
+        """
+        V2.1 잔고 한 줄. average_price=거래소 평단, total=가용+주문잠금.
+        문서: available+limit 이 전체 잔고.
+        """
+        try:
+            res = self.get_balance()
+        except (RuntimeError, requests.RequestException) as e:
+            log.warning("잔고 API 실패(get_currency_balance): %s", e)
+            return None
+        if not isinstance(res, dict) or res.get("result") != "success":
+            return None
+        sym = symbol.upper()
+        for b in res.get("balances", []):
+            if not isinstance(b, dict) or b.get("currency") != sym:
+                continue
+            try:
+                av = float(b.get("available", 0) or 0)
+                lm = float(b.get("limit", 0) or 0)
+                ap = b.get("average_price")
+                if ap is None or ap == "":
+                    avg = 0.0
+                else:
+                    avg = float(ap)
+            except (TypeError, ValueError):
+                return None
+            return {
+                "available": av,
+                "limit": lm,
+                "total": av + lm,
+                "average_price": avg,
+            }
+        return None
+
 
 # ─────────────────────────────────────────
 #  기술적 지표 계산
@@ -750,40 +784,6 @@ class TradingBot:
                 except (TypeError, ValueError):
                     return 0.0
         return 0.0
-
-    def get_currency_balance(self, symbol: str) -> Optional[dict]:
-        """
-        V2.1 잔고 한 줄. average_price=거래소 평단, total=가용+주문잠금.
-        문서: available+limit 이 전체 잔고.
-        """
-        try:
-            res = self.get_balance()
-        except (RuntimeError, requests.RequestException) as e:
-            log.warning("잔고 API 실패(get_currency_balance): %s", e)
-            return None
-        if not isinstance(res, dict) or res.get("result") != "success":
-            return None
-        sym = symbol.upper()
-        for b in res.get("balances", []):
-            if not isinstance(b, dict) or b.get("currency") != sym:
-                continue
-            try:
-                av = float(b.get("available", 0) or 0)
-                lm = float(b.get("limit", 0) or 0)
-                ap = b.get("average_price")
-                if ap is None or ap == "":
-                    avg = 0.0
-                else:
-                    avg = float(ap)
-            except (TypeError, ValueError):
-                return None
-            return {
-                "available": av,
-                "limit": lm,
-                "total": av + lm,
-                "average_price": avg,
-            }
-        return None
 
     def run(self):
         log.info("=" * 50)
