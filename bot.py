@@ -15,6 +15,7 @@ import logging.handlers
 import os
 import sys
 from datetime import datetime
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Optional
 
 import requests
@@ -95,6 +96,15 @@ CONFIG = {
 
 BASE_URL = "https://api.coinone.co.kr"
 
+# 공개 GET: SSL/연결 끊김 등 일시 오류 시 재시도 횟수·간격
+PUBLIC_HTTP_RETRIES = 3
+PUBLIC_HTTP_BACKOFF_SEC = 0.45
+_TRANSIENT_HTTP_CODES = frozenset({429, 502, 503, 504})
+
+
+class TransientAPIError(Exception):
+    """SSL·연결·타임아웃·일부 5xx 등 일시적 장애. 메인 루프가 주기적으로 재시도."""
+
 
 # ─────────────────────────────────────────
 #  코인원 API 클라이언트
@@ -108,6 +118,50 @@ class CoinoneClient:
         self.access_token = access_token
         self.secret_key   = secret_key.encode()
         self._range_price_units_cache: dict[str, list] = {}
+        self._market_constraints_cache: dict[str, dict] = {}
+
+    def _public_get(
+        self,
+        api_label: str,
+        url: str,
+        *,
+        params: Optional[dict] = None,
+        timeout: float = 10,
+    ):
+        """공개 GET. 일시적 네트워크/SSL/5xx(일부)는 재시도 후 TransientAPIError."""
+        last: Optional[BaseException] = None
+        for attempt in range(PUBLIC_HTTP_RETRIES):
+            try:
+                r = requests.get(url, params=params, timeout=timeout)
+                r.raise_for_status()
+                return r
+            except (
+                requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ReadTimeout,
+                requests.exceptions.ChunkedEncodingError,
+            ) as e:
+                last = e
+                if attempt + 1 < PUBLIC_HTTP_RETRIES:
+                    time.sleep(PUBLIC_HTTP_BACKOFF_SEC * (2**attempt))
+                    continue
+                break
+            except requests.exceptions.HTTPError as e:
+                last = e
+                code = e.response.status_code if e.response is not None else 0
+                if code in _TRANSIENT_HTTP_CODES and attempt + 1 < PUBLIC_HTTP_RETRIES:
+                    time.sleep(PUBLIC_HTTP_BACKOFF_SEC * (2**attempt))
+                    continue
+                log.error("%s HTTP 오류: %s", api_label, e)
+                raise RuntimeError(f"{api_label} 조회 실패: {e}") from e
+            except requests.exceptions.RequestException as e:
+                log.error("%s 요청 실패: %s", api_label, e)
+                raise RuntimeError(f"{api_label} 조회 실패: {e}") from e
+        hint = type(last).__name__ if last else "Unknown"
+        raise TransientAPIError(
+            f"{api_label} {PUBLIC_HTTP_RETRIES}회 재시도 후 실패 ({hint})"
+        ) from last
 
     def _sign(self, payload: dict) -> dict:
         payload["access_token"] = self.access_token
@@ -130,12 +184,10 @@ class CoinoneClient:
         url = f"{BASE_URL}/public/v2/chart/KRW/{symbol.upper()}"
         params = {"interval": interval, "size": min(max(1, count), 500)}  # API는 size, 1~500
         try:
-            r = requests.get(url, params=params, timeout=10)
-            r.raise_for_status()
+            r = self._public_get("캔들", url, params=params)
             data = r.json()
-        except requests.RequestException as e:
-            log.error("캔들 API 요청 실패: %s", e)
-            raise RuntimeError(f"캔들 조회 실패: {e}") from e
+        except TransientAPIError:
+            raise
         except json.JSONDecodeError as e:
             log.error("캔들 API 응답 JSON 파싱 실패: %s", e)
             raise RuntimeError(f"캔들 응답 파싱 실패: {e}") from e
@@ -152,12 +204,10 @@ class CoinoneClient:
         # 코인원 문서: orderbook/{quote_currency}/{target_currency} → KRW/BTC
         url = f"{BASE_URL}/public/v2/orderbook/KRW/{symbol.upper()}"
         try:
-            r = requests.get(url, timeout=10)
-            r.raise_for_status()
+            r = self._public_get("호가창", url)
             return r.json()
-        except requests.RequestException as e:
-            log.error("호가창 API 요청 실패: %s", e)
-            raise RuntimeError(f"호가창 조회 실패: {e}") from e
+        except TransientAPIError:
+            raise
         except json.JSONDecodeError as e:
             log.error("호가창 API 응답 JSON 파싱 실패: %s", e)
             raise RuntimeError(f"호가창 응답 파싱 실패: {e}") from e
@@ -165,12 +215,10 @@ class CoinoneClient:
     def get_ticker(self, symbol: str) -> dict:
         url = f"{BASE_URL}/public/v2/ticker_new/{symbol.upper()}/KRW"
         try:
-            r = requests.get(url, timeout=10)
-            r.raise_for_status()
+            r = self._public_get("티커", url)
             return r.json()
-        except requests.RequestException as e:
-            log.error("티커 API 요청 실패: %s", e)
-            raise RuntimeError(f"시세 조회 실패: {e}") from e
+        except TransientAPIError:
+            raise
         except json.JSONDecodeError as e:
             log.error("티커 API 응답 JSON 파싱 실패: %s", e)
             raise RuntimeError(f"시세 응답 파싱 실패: {e}") from e
@@ -182,12 +230,10 @@ class CoinoneClient:
             return self._range_price_units_cache[sym]
         url = f"{BASE_URL}/public/v2/range_units/KRW/{sym}"
         try:
-            r = requests.get(url, timeout=10)
-            r.raise_for_status()
+            r = self._public_get("호가 단위", url)
             data = r.json()
-        except requests.RequestException as e:
-            log.error("호가 단위 API 요청 실패: %s", e)
-            raise RuntimeError(f"호가 단위 조회 실패: {e}") from e
+        except TransientAPIError:
+            raise
         except json.JSONDecodeError as e:
             log.error("호가 단위 API JSON 파싱 실패: %s", e)
             raise RuntimeError(f"호가 단위 응답 파싱 실패: {e}") from e
@@ -227,6 +273,58 @@ class CoinoneClient:
             return str(int(round(snapped)))
         text = f"{snapped:.10f}".rstrip("0").rstrip(".")
         return text if text else "0"
+
+    def get_market_constraints(self, symbol: str) -> dict:
+        """종목별 최소 주문금액·수량단위 (오류 306 방지). GET /public/v2/markets/KRW/{symbol}"""
+        sym = symbol.upper()
+        if sym in self._market_constraints_cache:
+            return self._market_constraints_cache[sym]
+        url = f"{BASE_URL}/public/v2/markets/KRW/{sym}"
+        try:
+            r = self._public_get("마켓 정보", url)
+            data = r.json()
+        except TransientAPIError:
+            raise
+        except json.JSONDecodeError as e:
+            log.error("마켓 정보 API JSON 파싱 실패: %s", e)
+            raise RuntimeError(f"마켓 정보 응답 파싱 실패: {e}") from e
+        if data.get("result") != "success":
+            raise RuntimeError(f"마켓 정보 API 오류: {data}")
+        markets = data.get("markets") or []
+        if not markets:
+            raise RuntimeError("markets 배열이 비어 있습니다.")
+        row = markets[0]
+        mc = {
+            "min_order_amount": float(row["min_order_amount"]),
+            "min_qty": float(row["min_qty"]),
+            "qty_unit": float(row["qty_unit"]),
+            "qty_unit_str": str(row["qty_unit"]),
+            "max_order_amount": float(row["max_order_amount"]),
+        }
+        self._market_constraints_cache[sym] = mc
+        return mc
+
+    def preview_snapped_limit_krw(self, symbol: str, side: str, raw_price: float) -> float:
+        """주문 전 총액 검증용 지정가 스냅(실제 주문과 동일 규칙)."""
+        rows = self.get_range_price_units(symbol)
+        unit = self._price_unit_for_krw(float(raw_price), rows)
+        return float(self._snap_krw_limit_price(float(raw_price), side, unit))
+
+    @staticmethod
+    def _floor_qty_string(qty: float, qty_unit_str: str) -> str:
+        """qty_unit 배수로 내린 수량을 과학적 표기 없는 문자열로 (API qty 필드용)."""
+        unit = Decimal(qty_unit_str)
+        qd = Decimal(str(qty))
+        if qd <= 0:
+            return "0"
+        n = (qd / unit).to_integral_value(rounding=ROUND_FLOOR)
+        qn = n * unit
+        if qn <= 0:
+            return "0"
+        s = format(qn, "f")
+        if "." in s:
+            s = s.rstrip("0").rstrip(".")
+        return s if s else "0"
 
     # ── Private API ─────────────────────────
     def get_balance(self) -> dict:
@@ -277,12 +375,18 @@ class CoinoneClient:
         order_type: 'LIMIT' or 'MARKET'
         post_only: LIMIT 전용. True면 메이커만(즉시 체결 시 주문 거절). 기본 False.
         """
+        mc = self.get_market_constraints(symbol)
+        qty_s = self._floor_qty_string(qty, mc["qty_unit_str"])
+        if qty_s == "0":
+            raise ValueError(
+                f"주문 수량이 qty_unit({mc['qty_unit_str']})으로 내림하면 0입니다."
+            )
         payload = {
             "quote_currency": "KRW",
             "target_currency": symbol.upper(),
             "type": order_type,
             "side": side,
-            "qty": str(qty),
+            "qty": qty_s,
         }
         if order_type == "LIMIT" and price is not None:
             rows = self.get_range_price_units(symbol)
@@ -558,13 +662,18 @@ class RiskManager:
         pnl_pct = (pnl_krw / cost) * 100 if cost > 0 else 0.0
         return pnl_krw, pnl_pct
 
-    def calc_buy_qty(self, balance_krw: float, current_price: float) -> float:
-        """매수 수량 계산 (원화 잔고의 ORDER_RATIO 비율)"""
+    def calc_buy_qty(
+        self, balance_krw: float, current_price: float, qty_unit_str: str
+    ) -> float:
+        """매수 수량: 잔고×ORDER_RATIO 범위에서 qty_unit 배수로 내림 (거래소 규칙)."""
         if current_price is None or current_price <= 0:
             raise ValueError("current_price는 0보다 큰 값이어야 합니다.")
-        budget = balance_krw * self.cfg["ORDER_RATIO"]
-        qty    = budget / current_price
-        return round(qty, 6)
+        budget = Decimal(str(balance_krw)) * Decimal(str(self.cfg["ORDER_RATIO"]))
+        unit = Decimal(qty_unit_str)
+        price = Decimal(str(current_price))
+        raw = budget / price
+        n = (raw / unit).to_integral_value(rounding=ROUND_FLOOR)
+        return float(n * unit)
 
 
 # ─────────────────────────────────────────
@@ -646,6 +755,12 @@ class TradingBot:
             except KeyboardInterrupt:
                 log.info("봇 종료 (사용자 중단)")
                 break
+            except TransientAPIError as e:
+                log.warning(
+                    "일시적 API/네트워크 오류 — %s초 후 재시도 | %s",
+                    self.cfg["LOOP_INTERVAL"],
+                    e,
+                )
             except Exception as e:
                 log.error(f"루프 오류: {e}", exc_info=True)
 
@@ -701,15 +816,60 @@ class TradingBot:
     def _buy(self, price: float):
         try:
             krw = self.get_krw_balance()
-            qty = self.risk.calc_buy_qty(krw, price)
+            mc = self.client.get_market_constraints(self.symbol)
+            qty = self.risk.calc_buy_qty(krw, price, mc["qty_unit_str"])
+            min_krw = mc["min_order_amount"]
 
-            if qty * price < 1000:  # 코인원 최소 주문 금액 체크
+            limit_price = round(price * 1.0005)
+            snapped = self.client.preview_snapped_limit_krw(
+                self.symbol, "BUY", float(limit_price)
+            )
+            notional = qty * snapped
+            if notional < min_krw:
+                unit = Decimal(mc["qty_unit_str"])
+                snapped_d = Decimal(str(snapped))
+                min_amt = Decimal(str(min_krw))
+                min_q = min_amt / snapped_d
+                n = (min_q / unit).to_integral_value(rounding=ROUND_CEILING)
+                qn = n * unit
+                while qn * snapped_d < min_amt:
+                    n += 1
+                    qn = n * unit
+                qty_up = float(qn)
+                max_q = float(
+                    (Decimal(str(krw)) / snapped_d / unit).to_integral_value(
+                        rounding=ROUND_FLOOR
+                    )
+                    * unit
+                )
+                if qty_up <= max_q:
+                    qty = qty_up
+                    notional = qty * snapped
+                    log.info(
+                        "최소 주문 금액 %s원 충족을 위해 수량 조정 → %s BTC (총액 약 %s원)",
+                        f"{min_krw:,.0f}",
+                        self.client._floor_qty_string(qty, mc["qty_unit_str"]),
+                        f"{notional:,.0f}",
+                    )
+                else:
+                    log.warning(
+                        "주문 총액이 거래소 최소 %s원 미만입니다 (현재 약 %s원, 잔고 %s원). "
+                        "ORDER_RATIO·잔고를 늘리세요.",
+                        f"{min_krw:,.0f}",
+                        f"{notional:,.0f}",
+                        f"{krw:,.0f}",
+                    )
+                    return
+
+            if qty <= 0:
                 log.warning(f"잔고 부족: {krw:,.0f} KRW")
                 return
 
             # 지정가 매수 (현재가 기준 0.05% 위 → 빠른 체결)
-            limit_price = round(price * 1.0005)
-            log.info(f"📈 매수 주문: {qty} {self.symbol.upper()} @ {limit_price:,.0f} KRW")
+            log.info(
+                f"📈 매수 주문: {self.client._floor_qty_string(qty, mc['qty_unit_str'])} "
+                f"{self.symbol.upper()} @ {limit_price:,.0f} KRW"
+            )
 
             # ⚠️  실제 주문 실행 시 아래 주석을 해제하세요
             res = self.client.place_order(self.symbol, "BUY", qty, limit_price)
@@ -744,10 +904,30 @@ class TradingBot:
                     return
 
             limit_price = round(price * 0.9995)
-            log.info(f"📉 매도 주문({reason}): {qty} {self.symbol.upper()} @ {limit_price:,.0f} KRW")
+            mc = self.client.get_market_constraints(self.symbol)
+            snapped = self.client.preview_snapped_limit_krw(
+                self.symbol, "SELL", float(limit_price)
+            )
+            qty_s = self.client._floor_qty_string(qty, mc["qty_unit_str"])
+            if qty_s == "0":
+                log.warning("매도 수량이 호가 단위로 내림하면 0입니다.")
+                return
+            qty_ord = float(Decimal(qty_s))
+            sell_notional = qty_ord * snapped
+            if sell_notional < mc["min_order_amount"]:
+                log.warning(
+                    "매도 총액 %s원 < 거래소 최소 %s원 — 체결 불가로 주문 생략.",
+                    f"{sell_notional:,.0f}",
+                    f"{mc['min_order_amount']:,.0f}",
+                )
+                return
+
+            log.info(
+                f"📉 매도 주문({reason}): {qty_s} {self.symbol.upper()} @ {limit_price:,.0f} KRW"
+            )
 
             # ⚠️  실제 주문 실행 시 아래 주석을 해제하세요
-            res = self.client.place_order(self.symbol, "SELL", qty, limit_price)
+            res = self.client.place_order(self.symbol, "SELL", qty_ord, limit_price)
             log.info(f"주문 결과: {res}")
 
             if res.get("result") == "error":
@@ -755,7 +935,7 @@ class TradingBot:
                 return
             if self.risk.entry_price and self.risk.entry_price > 0:
                 pnl_krw, pnl_pct = self.risk.pnl_after_fee(
-                    self.risk.entry_price, price, qty
+                    self.risk.entry_price, price, qty_ord
                 )
                 log.info(f"손익(수수료 반영): {pnl_krw:+,.0f} KRW ({pnl_pct:+.2f}%)")
             self.risk.clear_position()
