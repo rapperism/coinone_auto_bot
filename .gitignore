@@ -1,4 +1,4 @@
 .env
 venv/
-bot.log
+logs/
 __pycache__

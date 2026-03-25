@@ -1,3 +1,5 @@
 #!/bin/bash
 source venv/Scripts/activate
-python bot.py
+export PYTHONIOENCODING=utf-8
+export PYTHONUTF8=1
+python -X utf8 bot.py

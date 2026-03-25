@@ -215,10 +215,12 @@ class CoinoneClient:
 
     def place_order(self, symbol: str, side: str,
                     qty: float, price: Optional[float] = None,
-                    order_type: str = "LIMIT") -> dict:
+                    order_type: str = "LIMIT",
+                    post_only: bool = False) -> dict:
         """
         side: 'BUY' or 'SELL'
         order_type: 'LIMIT' or 'MARKET'
+        post_only: LIMIT 전용. True면 메이커만(즉시 체결 시 주문 거절). 기본 False.
         """
         payload = {
             "quote_currency": "KRW",
@@ -229,6 +231,7 @@ class CoinoneClient:
         }
         if order_type == "LIMIT" and price is not None:
             payload["price"] = str(int(price))
+            payload["post_only"] = post_only
 
         return self._private_post("/v2.1/order", payload)
 
