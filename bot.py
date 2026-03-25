@@ -910,68 +910,96 @@ class TradingBot:
                 f"{row['limit']}",
             )
 
+    def _max_affordable_buy_qty(
+        self, krw: float, snapped: float, qty_unit_str: str
+    ) -> float:
+        """가용 원화로 살 수 있는 최대 수량(지정가 스냅 기준, 매수 수수료 여유 반영)."""
+        fee_pct = float(self.cfg.get("TAKER_FEE_PCT", 0.02)) / 100.0
+        k_adj = Decimal(str(krw)) / (Decimal("1") + Decimal(str(fee_pct)))
+        unit = Decimal(qty_unit_str)
+        p = Decimal(str(snapped))
+        if p <= 0 or k_adj <= 0:
+            return 0.0
+        steps = (k_adj / p / unit).to_integral_value(rounding=ROUND_FLOOR)
+        q = float(steps * unit)
+        return q if q > 0 else 0.0
+
+    @staticmethod
+    def _min_qty_for_min_order_krw(
+        snapped: float, min_krw: float, qty_unit_str: str
+    ) -> float:
+        """거래소 최소 주문 금액(min_krw)을 만족하는 최소 수량(qty_unit 배수)."""
+        unit = Decimal(qty_unit_str)
+        snapped_d = Decimal(str(snapped))
+        min_amt = Decimal(str(min_krw))
+        need = min_amt / snapped_d
+        n = (need / unit).to_integral_value(rounding=ROUND_CEILING)
+        qn = n * unit
+        while qn * snapped_d < min_amt:
+            n += 1
+            qn = n * unit
+        return float(qn)
+
     def _buy(self, price: float):
         try:
             mc = self.client.get_market_constraints(self.symbol)
-            min_q = float(mc["min_qty"])
-            if self.risk.holding_qty >= min_q:
+            min_qty_coin = float(mc["min_qty"])
+            if self.risk.holding_qty >= min_qty_coin:
                 log.info(
                     "이미 코인 보유 중(거래소 동기화 기준) — 추가 매수 생략",
                 )
                 return
 
             krw = self.get_krw_balance()
-            qty = self.risk.calc_buy_qty(krw, price, mc["qty_unit_str"])
             min_krw = mc["min_order_amount"]
+            qty_unit_str = mc["qty_unit_str"]
 
             limit_price = round(price * 1.0005)
             snapped = self.client.preview_snapped_limit_krw(
                 self.symbol, "BUY", float(limit_price)
             )
-            notional = qty * snapped
-            if notional < min_krw:
-                unit = Decimal(mc["qty_unit_str"])
-                snapped_d = Decimal(str(snapped))
-                min_amt = Decimal(str(min_krw))
-                min_q = min_amt / snapped_d
-                n = (min_q / unit).to_integral_value(rounding=ROUND_CEILING)
-                qn = n * unit
-                while qn * snapped_d < min_amt:
-                    n += 1
-                    qn = n * unit
-                qty_up = float(qn)
-                max_q = float(
-                    (Decimal(str(krw)) / snapped_d / unit).to_integral_value(
-                        rounding=ROUND_FLOOR
-                    )
-                    * unit
-                )
-                if qty_up <= max_q:
-                    qty = qty_up
-                    notional = qty * snapped
-                    log.info(
-                        "최소 주문 금액 %s원 충족을 위해 수량 조정 → %s BTC (총액 약 %s원)",
-                        f"{min_krw:,.0f}",
-                        self.client._floor_qty_string(qty, mc["qty_unit_str"]),
-                        f"{notional:,.0f}",
-                    )
-                else:
-                    log.warning(
-                        "주문 총액이 거래소 최소 %s원 미만입니다 (현재 약 %s원, 잔고 %s원). "
-                        "ORDER_RATIO·잔고를 늘리세요.",
-                        f"{min_krw:,.0f}",
-                        f"{notional:,.0f}",
-                        f"{krw:,.0f}",
-                    )
-                    return
-
-            if qty <= 0:
-                log.warning(f"잔고 부족: {krw:,.0f} KRW")
+            max_cap = self._max_affordable_buy_qty(krw, snapped, qty_unit_str)
+            if max_cap <= 0:
+                log.warning("가용 원화 없음 (%s원)", f"{krw:,.0f}")
                 return
+
+            qty_wish = self.risk.calc_buy_qty(krw, price, qty_unit_str)
+            qty_floor = 0.0
+            if qty_wish * snapped < min_krw:
+                qty_floor = self._min_qty_for_min_order_krw(
+                    snapped, min_krw, qty_unit_str
+                )
+            qty = min(max(qty_wish, qty_floor), max_cap)
+            notional = qty * snapped
+
+            if notional < min_krw - 1e-6:
+                log.warning(
+                    "수수료 반영 가용 한도(약 %s원)가 거래소 최소주문(%s원) 미만 — 잔고를 늘리세요.",
+                    f"{notional:,.0f}",
+                    f"{min_krw:,.0f}",
+                )
+                return
+            if qty <= 0:
+                log.warning("매수 수량 0")
+                return
+
+            if qty < max(qty_wish, qty_floor) - 1e-12:
+                log.info(
+                    "수수료·잔고 한도 내 최대 매수 (약 %s원 / 가용 %s원, 의도·최소주문 중 큰 값을 캡)",
+                    f"{notional:,.0f}",
+                    f"{krw:,.0f}",
+                )
+            elif qty_floor > qty_wish and qty == qty_floor:
+                log.info(
+                    "최소 주문 %s원 맞춤 → %s BTC (약 %s원)",
+                    f"{min_krw:,.0f}",
+                    self.client._floor_qty_string(qty, qty_unit_str),
+                    f"{notional:,.0f}",
+                )
 
             # 지정가 매수 (현재가 기준 0.05% 위 → 빠른 체결)
             log.info(
-                f"📈 매수 주문: {self.client._floor_qty_string(qty, mc['qty_unit_str'])} "
+                f"📈 매수 주문: {self.client._floor_qty_string(qty, qty_unit_str)} "
                 f"{self.symbol.upper()} @ {limit_price:,.0f} KRW"
             )
 
