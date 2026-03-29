@@ -87,18 +87,23 @@ CONFIG = {
     "TAKE_PROFIT_PCT":   0.05,    # 매수가 대비 +5% 익절
     "TAKER_FEE_PCT":     0.02,    # 코인원 API 체결 수수료 0.02% (매수·매도 각각). 수수료 감안 손익·손실 매도 보류에 사용
 
-    # 포지션 보유 중 신호가 BUY가 아니고(HOLD/SELL), 현재가가 수수료 손익분기 이상이면 청산.
-    # BUY만 뜨다가 가격이 분기 아래로 내려온 뒤 SELL이 나오면 매도 보류에 걸리는 구간을 줄임.
-    "EXIT_WHEN_NOT_BUY_ABOVE_BE": True,
+    # ── 청산 (수익 목표: +5% 익절·전략 SELL이 먹을 틈을 주려면 조기 청산을 끄거나 완화) ──
+    # True: HOLD/SELL 이고 현재가≥손익분기면 매도(기존 동작, 소액 이익에 그침).
+    # False: 위 조기 청산 없음 → 손절/익절/전략 SELL 위주(익절까지 기다리기 쉬움).
+    "EXIT_WHEN_NOT_BUY_ABOVE_BE": False,
+    # EXIT_WHEN_NOT_BUY_ABOVE_BE True일 때만: 평단 대비 (현재가-평단)/평단 ≥ 이 값일 때만 조기 청산.
+    # 0이면 손익분기만 보며 즉시 청산. 예 0.015 = +1.5% 이상일 때만.
+    "EXIT_WEAK_SIGNAL_MIN_GAIN_PCT": 0.015,
     # True면 전략 SELL만 손익분기 미만에서도 매도 시도(실제 손실 가능). False 권장.
     "STRATEGY_SELL_ALLOW_BELOW_BREAKEVEN": False,
 
-    # 봇 루프 주기 (초)
-    "LOOP_INTERVAL":     60,
-
-    # 캔들 개수 (분봉)
+    # ── 타임프레임·루프 (1m는 노이즈·수수료 부담 큼 → 기본 15m) ──
+    "LOOP_INTERVAL":     120,     # 초. 봉 주기에 맞춰 60~300 조정
     "CANDLE_COUNT":      100,
-    "CANDLE_INTERVAL":   "1m",    # 1m / 3m / 5m / 15m / 1h / 4h / 1D
+    "CANDLE_INTERVAL":   "15m",   # 1m / 3m / 5m / 15m / 1h / 4h / 1D
+
+    # ── 포지션: 1회 매수에 쓸 원화 상한 (0이면 미사용). ORDER_RATIO×잔고와 함께 더 작은 값 적용.
+    "MAX_ORDER_KRW":     0,
 }
 
 BASE_URL = "https://api.coinone.co.kr"
@@ -704,12 +709,19 @@ class RiskManager:
         return pnl_krw, pnl_pct
 
     def calc_buy_qty(
-        self, balance_krw: float, current_price: float, qty_unit_str: str
+        self,
+        balance_krw: float,
+        current_price: float,
+        qty_unit_str: str,
+        *,
+        max_spend_krw: Optional[float] = None,
     ) -> float:
-        """매수 수량: 잔고×ORDER_RATIO 범위에서 qty_unit 배수로 내림 (거래소 규칙)."""
+        """매수 수량: 잔고×ORDER_RATIO(및 선택적 max_spend_krw 상한)에서 qty_unit 배수로 내림."""
         if current_price is None or current_price <= 0:
             raise ValueError("current_price는 0보다 큰 값이어야 합니다.")
         budget = Decimal(str(balance_krw)) * Decimal(str(self.cfg["ORDER_RATIO"]))
+        if max_spend_krw is not None and max_spend_krw > 0:
+            budget = min(budget, Decimal(str(max_spend_krw)))
         unit = Decimal(qty_unit_str)
         price = Decimal(str(current_price))
         raw = budget / price
@@ -861,12 +873,16 @@ class TradingBot:
         if signal == "BUY" and not in_pos:
             self._buy(price)
         elif (
-            self.cfg.get("EXIT_WHEN_NOT_BUY_ABOVE_BE", True)
+            self.cfg.get("EXIT_WHEN_NOT_BUY_ABOVE_BE", False)
             and in_pos
             and signal != "BUY"
             and price >= self.risk.break_even_price(self.risk.entry_price)
         ):
-            self._sell_all(price, reason="약세·수수료분기 이상 청산")
+            ep = self.risk.entry_price
+            min_gain = float(self.cfg.get("EXIT_WEAK_SIGNAL_MIN_GAIN_PCT", 0.0))
+            unrealized = (price - ep) / ep if ep and ep > 0 else 0.0
+            if min_gain <= 0 or unrealized >= min_gain:
+                self._sell_all(price, reason="약세·수수료분기 이상 청산")
         elif signal == "SELL" and in_pos:
             self._sell_all(price, reason="전략 신호")
 
@@ -963,7 +979,14 @@ class TradingBot:
                 log.warning("가용 원화 없음 (%s원)", f"{krw:,.0f}")
                 return
 
-            qty_wish = self.risk.calc_buy_qty(krw, price, qty_unit_str)
+            spend_cap = self.cfg.get("MAX_ORDER_KRW") or 0
+            spend_cap_f = float(spend_cap) if spend_cap else 0.0
+            qty_wish = self.risk.calc_buy_qty(
+                krw,
+                price,
+                qty_unit_str,
+                max_spend_krw=spend_cap_f if spend_cap_f > 0 else None,
+            )
             qty_floor = 0.0
             if qty_wish * snapped < min_krw:
                 qty_floor = self._min_qty_for_min_order_krw(
